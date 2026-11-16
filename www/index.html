@@ -1,16 +1,156 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="vi">
 <head>
-    <title>bksysnet@hcmut welcome</title>
-
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CO3094 P2P Chat</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <script>
+    (function () {
+      var username = sessionStorage.getItem("username");
+      var requireCookie = sessionStorage.getItem("require_cookie") === "1";
+      var hasCookie = Boolean(document.cookie && document.cookie.trim().length > 0);
+      if (!username || (requireCookie && !hasCookie)) {
+        sessionStorage.removeItem("username");
+        window.location.replace("/login.html");
+      }
+    })();
+  </script>
 </head>
-
 <body>
-<div>
-    <h1>bksysnet@hcmut  Domain</h1>
-    <p>This domain is for use in illustrative examples in documents.
-    </p>
-  
-</div>
+  <!-- Login Overlay Modal -->
+  <div id="loginOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="brand-logo">P2P</div>
+        <h1 id="loginTitle">CO3094 StreapRous Chat</h1>
+        <p class="login-subtitle">Đăng nhập vào Peer Node cục bộ để bắt đầu kết nối</p>
+      </div>
+
+      <form id="loginForm" class="login-form" autocomplete="off">
+        <div class="form-group">
+          <label for="loginUsername">Username</label>
+          <input
+            type="text"
+            id="loginUsername"
+            name="username"
+            placeholder="Ví dụ: alice"
+            required
+          >
+        </div>
+
+        <div class="form-group">
+          <label for="loginPassword">Password</label>
+          <input
+            type="password"
+            id="loginPassword"
+            name="password"
+            placeholder="Nhập mật khẩu"
+            required
+          >
+        </div>
+
+        <p id="loginError" class="error-text hidden" role="alert"></p>
+
+        <button type="submit" id="loginSubmitBtn" class="btn btn-primary btn-block">
+          Đăng nhập
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main 2-Column Chat Layout -->
+  <div id="chatApp" class="app-shell hidden">
+    <!-- Left Sidebar -->
+    <aside class="sidebar">
+      <!-- Current Peer Profile -->
+      <div class="peer-profile">
+        <div class="avatar avatar-self" id="selfAvatar">?</div>
+        <div class="peer-profile-meta">
+          <div class="peer-profile-name">
+            <span id="selfUsername">Guest</span>
+            <span class="status-dot online" title="Online"></span>
+          </div>
+          <div class="peer-profile-port" id="selfP2pInfo">P2P Port: --</div>
+        </div>
+        <button type="button" id="logoutBtn" class="btn btn-logout" title="Đăng xuất">
+          Thoát
+        </button>
+      </div>
+
+      <!-- Channels List -->
+      <section class="sidebar-section">
+        <div class="section-header">
+          <span>Channels đã tham gia</span>
+        </div>
+        <ul id="channelsList" class="nav-list">
+          <li class="nav-item active" data-type="global" data-id="global">
+            <span class="nav-label"># Global Broadcast</span>
+            <span class="unread-badge hidden" id="badge-global">0</span>
+          </li>
+        </ul>
+      </section>
+
+      <!-- Active Peers List -->
+      <section class="sidebar-section sidebar-section-grow">
+        <div class="section-header">
+          <span>Active Peers</span>
+          <span class="peer-count-pill" id="activePeerCount">0</span>
+        </div>
+        <ul id="activePeersList" class="nav-list peers-list">
+          <li class="empty-hint">Đang tải danh sách peer...</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- Right Main Chat Window -->
+    <main class="chat-main">
+      <header class="chat-header">
+        <div class="chat-header-info">
+          <h2 id="activeChannelTitle"># Global Broadcast</h2>
+          <p id="activeChannelSubtitle" class="chat-header-sub">
+            Gửi tin nhắn quảng bá trực tiếp tới toàn bộ peer đang online
+          </p>
+        </div>
+        <div id="statusToast" class="status-toast hidden" role="status"></div>
+      </header>
+
+      <div id="messagesContainer" class="messages-container" aria-live="polite">
+        <div class="empty-messages">Chưa có tin nhắn nào trong kênh này.</div>
+      </div>
+
+      <!-- File Transfer Progress Bar -->
+      <div id="transferProgressBox" class="transfer-progress hidden" aria-live="polite">
+        <div class="transfer-progress-top">
+          <span id="transferFileName" class="transfer-file-name">Đang truyền file...</span>
+          <span id="transferStatusBadge" class="transfer-status-badge">0%</span>
+        </div>
+        <div class="transfer-bar-track">
+          <div id="transferBarFill" class="transfer-bar-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <form id="messageForm" class="chat-composer" autocomplete="off">
+        <input
+          type="file"
+          id="fileInput"
+          class="file-input"
+          title="Chọn file để gửi qua P2P"
+        >
+        <input
+          type="text"
+          id="messageInput"
+          class="message-input"
+          placeholder="Nhập tin nhắn và nhấn Enter để gửi..."
+          maxlength="2000"
+        >
+        <button type="submit" id="sendBtn" class="btn btn-primary send-btn">
+          Gửi
+        </button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/static/js/chat.js"></script>
 </body>
 </html>

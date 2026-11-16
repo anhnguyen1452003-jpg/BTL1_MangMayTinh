@@ -108,24 +108,18 @@ class Request():
         """Prepares the entire request with the given parameters."""
 
         # Prepare the request line from the request header
-        print("[Request] prepare request missg {}".format(request))
+        print("[Request] prepare request missg {}".format(request[:500]))
         self.method, self.path, self.version = self.extract_request_line(request)
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
-        #
-        # TODO:  Parse headers and body  - phan tich tieu de va noi dung
-        # with self.fetch_headers_body(request)
-        # and self.prepare_headers(self._raw_headers)
-        #
-
-        # self._raw_headers = ... 
-        # self._raw_body =...
-        # self.headers = ...
-        
         # Tách raw headers và raw body từ chuỗi HTTP request
         self._raw_headers, self._raw_body = self.fetch_headers_body(request)
         self.body = self._raw_body
         self.headers = self.prepare_headers(self._raw_headers)
+        if self.path:
+            self.headers["x-request-path"] = self.path
+            if "?" in self.path:
+                self.headers["x-query-string"] = self.path.split("?", 1)[1]
         print("[Request] Parsed headers: {}".format(self.headers))
 
         #
@@ -137,8 +131,9 @@ class Request():
         # Gắn hook tương ứng với (METHOD, path) nếu có cấu hình routes từ StreapRous
         if routes and routes != {}:
             self.routes = routes
+            base_path = self.path.split("?", 1)[0] if self.path else self.path
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
-            self.hook = routes.get((self.method, self.path))
+            self.hook = routes.get((self.method, self.path)) or routes.get((self.method, base_path))
             print("[Request] Hook has request {}".format(self.hook))
 
             #

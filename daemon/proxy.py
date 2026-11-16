@@ -78,6 +78,85 @@ def forward_request(host, port, request):
             "\r\n"
             "404 Not Found"
         ).encode('utf-8')
+    finally:
+        backend.close()
+
+
+def _apply_proxy_set_headers(request, set_headers, hostname):
+    """Insert or overwrite headers specified by proxy_set_header directives."""
+    if not set_headers:
+        return request
+
+    sep = "\r\n\r\n" if "\r\n\r\n" in request else ("\n\n" if "\n\n" in request else None)
+    if sep is not None:
+        header_part, body_part = request.split(sep, 1)
+        line_sep = "\r\n" if "\r\n" in header_part else "\n"
+    else:
+        header_part, body_part = request, ""
+        line_sep = "\r\n"
+
+    lines = header_part.split(line_sep)
+    if not lines:
+        return request
+
+    req_line = lines[0]
+    header_lines = lines[1:]
+
+    resolved = {}
+    for name, value in set_headers.items():
+        val = hostname if value == "$host" else value
+        resolved[name] = val
+
+    override_lower = {k.lower(): (k, v) for k, v in resolved.items()}
+    seen = set()
+    updated_lines = []
+    for line in header_lines:
+        if ":" in line:
+            hdr_name = line.split(":", 1)[0].strip().lower()
+            if hdr_name in override_lower:
+                if hdr_name not in seen:
+                    orig_name, new_val = override_lower[hdr_name]
+                    updated_lines.append(f"{orig_name}: {new_val}")
+                    seen.add(hdr_name)
+                continue
+        updated_lines.append(line)
+
+    for hdr_lower, (orig_name, new_val) in override_lower.items():
+        if hdr_lower not in seen:
+            updated_lines.append(f"{orig_name}: {new_val}")
+
+    rebuilt_headers = line_sep.join([req_line] + updated_lines)
+    if sep is not None:
+        return rebuilt_headers + sep + body_part
+    return rebuilt_headers
+
+
+def _recv_full_http_request(conn):
+    """Read a complete HTTP request including any Content-Length body."""
+    buffer = b""
+    while b"\r\n\r\n" not in buffer:
+        chunk = conn.recv(65535)
+        if not chunk:
+            return buffer.decode("utf-8", errors="replace")
+        buffer += chunk
+
+    header_part, body_part = buffer.split(b"\r\n\r\n", 1)
+    content_length = 0
+    for line in header_part.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            try:
+                content_length = max(0, int(line.split(b":", 1)[1].strip()))
+            except ValueError:
+                content_length = 0
+            break
+
+    while len(body_part) < content_length:
+        chunk = conn.recv(min(65535, content_length - len(body_part)))
+        if not chunk:
+            break
+        body_part += chunk
+
+    return (header_part + b"\r\n\r\n" + body_part).decode("utf-8", errors="replace")
 
 
 def resolve_routing_policy(hostname, routes):
@@ -91,7 +170,8 @@ def resolve_routing_policy(hostname, routes):
     """
 
     print(hostname)
-    proxy_map, policy = routes.get(hostname,('127.0.0.1:9000','round-robin'))
+    entry = routes.get(hostname, ('127.0.0.1:9000', 'round-robin'))
+    proxy_map, policy = entry[0], entry[1]
     print(proxy_map)
     print(policy)
 
@@ -147,14 +227,22 @@ def handle_client(ip, port, conn, addr, routes):
     :params routes (dict): dictionary mapping hostnames and location.
     """
 
-    request = conn.recv(1024).decode()
+    request = _recv_full_http_request(conn)
+    if not request:
+        conn.close()
+        return
 
     # Extract hostname
+    hostname = ""
     for line in request.splitlines():
         if line.lower().startswith('host:'):
             hostname = line.split(':', 1)[1].strip()
+            break
 
     print("[Proxy] {} at Host: {}".format(addr, hostname))
+
+    entry = routes.get(hostname)
+    set_headers = entry[2] if entry and len(entry) >= 3 else {}
 
     # Resolve the matching destination in routes and need conver port
     # to integer value
@@ -166,7 +254,8 @@ def handle_client(ip, port, conn, addr, routes):
 
     if resolved_host:
         print("[Proxy] Host name {} is forwarded to {}:{}".format(hostname,resolved_host, resolved_port))
-        response = forward_request(resolved_host, resolved_port, request)        
+        forwarded_request = _apply_proxy_set_headers(request, set_headers, hostname)
+        response = forward_request(resolved_host, resolved_port, forwarded_request)        
     else:
         response = (
             "HTTP/1.1 404 Not Found\r\n"
@@ -195,6 +284,7 @@ def run_proxy(ip, port, routes):
     """
 
     proxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    proxy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     try:
         proxy.bind((ip, port))

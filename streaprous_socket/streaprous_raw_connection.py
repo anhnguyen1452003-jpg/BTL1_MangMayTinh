@@ -26,7 +26,10 @@ import threading
 import time
 import queue
 from collections import namedtuple
-import netifaces
+try:
+    import netifaces
+except ImportError:
+    netifaces = None
 
 # Import streaprout packet dispatcher functions
 from .streaprous_packet_dispatcher import (
@@ -203,14 +206,13 @@ def build_ip_header(src_ip, dest_ip, protocol, payload_len):
     #       handling function
     identification = 0x1234
     flags_fragment = 0x4000
-    flags_offset = 0 
     ttl = 64
     draft_checksum = 0
     
     # Build draft header with no checksum
     ip_header_temp = struct.pack('!BBHHHBBH4s4s',
         version_ihl, tos, total_len, identification,
-        flags_offset, ttl, protocol, draft_checksum,
+        flags_fragment, ttl, protocol, draft_checksum,
         socket.inet_aton(src_ip), socket.inet_aton(dest_ip)
     )
     
@@ -220,7 +222,7 @@ def build_ip_header(src_ip, dest_ip, protocol, payload_len):
     # Build the final IP header
     ip_header = struct.pack('!BBHHHBBH4s4s',
         version_ihl, tos, total_len, identification,
-        flags_offset, ttl, protocol, ip_checksum,
+        flags_fragment, ttl, protocol, ip_checksum,
         socket.inet_aton(src_ip), socket.inet_aton(dest_ip)
     )
     
@@ -339,31 +341,42 @@ def get_interface_ip(interface_name: str = None) -> str:
     Returns:
         IPv4 address string
     """
-    try:
-        if interface_name:
-            addrs = netifaces.ifaddresses(interface_name)
-            if netifaces.AF_INET in addrs:
-                return addrs[netifaces.AF_INET][0]['addr']
-        else:
-            # Try to get default route interface
-            gateways = netifaces.gateways()
-            default_gateway = gateways.get('default', {}).get(netifaces.AF_INET)
-            if default_gateway:
-                iface = default_gateway[1]
-                addrs = netifaces.ifaddresses(iface)
+    if netifaces is not None:
+        try:
+            if interface_name:
+                addrs = netifaces.ifaddresses(interface_name)
                 if netifaces.AF_INET in addrs:
                     return addrs[netifaces.AF_INET][0]['addr']
-    except Exception:
-        pass
+            else:
+                # Try to get default route interface
+                gateways = netifaces.gateways()
+                default_gateway = gateways.get('default', {}).get(netifaces.AF_INET)
+                if default_gateway:
+                    iface = default_gateway[1]
+                    addrs = netifaces.ifaddresses(iface)
+                    if netifaces.AF_INET in addrs:
+                        return addrs[netifaces.AF_INET][0]['addr']
+        except Exception:
+            pass
+    elif interface_name in ("lo", "lo0"):
+        return "127.0.0.1"
     
-    # Fallback: try to get any non-loopback IP
+    # Fallback: try to get any non-loopback IP using standard library
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+        finally:
+            s.close()
     except Exception:
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+            if ip:
+                return ip
+        except Exception:
+            pass
         return "127.0.0.1"
 
 
@@ -770,6 +783,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
 def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
     """
     Send data on an established connection using raw sockets.
+    Splits payloads larger than MSS into sequential TCP segments.
     
     Args:
         s: Raw socket
@@ -779,6 +793,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     Returns:
         int: Number of bytes sent, or -1 on error
     """
+    MSS = 1400
     client_ip = conn_info.client_ip
     client_port = conn_info.client_port
     client_key = (client_ip, client_port)
@@ -790,24 +805,35 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             print(f"[Streap_raw] run_conn_send Connection not found for {client_ip}:{client_port}")
             return -1
         session = connections[client_key]
+
+    if not payload:
+        return 0
     
     try:
-        bytes_sent = send_tcp_data_segment(
-            s, listen_ip, client_ip, listen_port, client_port,
-            seq=session.server_seq, ack_seq=session.client_seq, payload=payload
-        )
+        current_seq = session.server_seq
+        total_sent = 0
+
+        for offset in range(0, len(payload), MSS):
+            chunk = payload[offset:offset + MSS]
+            sent = send_tcp_data_segment(
+                s, listen_ip, client_ip, listen_port, client_port,
+                seq=current_seq, ack_seq=session.client_seq, payload=chunk
+            )
+            current_seq += sent
+            total_sent += sent
+
+        print(f"[Streap_raw] run_conn_send Sent {total_sent} bytes to {client_ip}:{client_port}")
         
-        print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
-        
-        # Update sequence numbers
+        # Update sequence numbers after all segments are transmitted
         with connections_lock:
             if client_key in connections:
-                connections[client_key] = session._replace(
-                    server_seq=session.server_seq + bytes_sent,
+                latest = connections[client_key]
+                connections[client_key] = latest._replace(
+                    server_seq=latest.server_seq + total_sent,
                     last_activity=time.time()
                 )
         
-        return bytes_sent
+        return total_sent
         
     except Exception as e:
         print(f"[Streap_raw] run_conn_send Error in run_conn_send: {e}")

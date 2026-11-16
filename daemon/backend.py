@@ -40,6 +40,7 @@ Usage Example:
 
 """
 
+import os
 import socket
 import threading
 import argparse
@@ -295,10 +296,23 @@ def create_backend(ip, port, routes={}, interface=None):
     """
     Entry point for creating and running the backend server.
 
+    Uses standard sockets on localhost, Windows, or when running without root
+    privileges; uses raw sockets only on Unix-like systems with root privileges
+    and a non-localhost IP address.
+
     :param ip (str): IP address to bind the server.
     :param port (int): Port number to listen on.
     :param routes (dict, optional): Dictionary of route handlers. Defaults to empty dict.
     :param interface (str, optional): Network interface to bind to. Defaults to platform default.
     """
+    is_localhost = (
+        ip in ('127.0.0.1', 'localhost', '::1')
+        or (isinstance(ip, str) and ip.startswith('127.'))
+    )
+    is_windows = (os.name == 'nt')
+    is_non_root = (hasattr(os, 'geteuid') and os.geteuid() != 0)
 
-    run_backend(ip, port, routes, interface)
+    if is_localhost or is_windows or is_non_root:
+        run_backend_standard(ip, port, routes)
+    else:
+        run_backend(ip, port, routes, interface)

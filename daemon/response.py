@@ -21,6 +21,7 @@ based on incoming requests.
 The current version supports MIME type detection, content loading and header formatting
 """
 import datetime
+import http
 import os
 import mimetypes
 from .dictionary import CaseInsensitiveDict
@@ -206,7 +207,14 @@ class Response():
         :rtype tuple: (int, bytes) representing content length and content data.
         """
 
-        filepath = os.path.join(base_dir, path.lstrip('/'))
+        rel_path = path.lstrip('/')
+        base_folder = os.path.basename(os.path.normpath(base_dir))
+        if base_folder == "static" and rel_path.startswith("static/"):
+            rel_path = rel_path[len("static/"):]
+        elif base_folder == "www" and rel_path.startswith("www/"):
+            rel_path = rel_path[len("www/"):]
+
+        filepath = os.path.join(base_dir, rel_path)
 
         print("[Response] Serving the object at location {}".format(filepath))
         #
@@ -236,22 +244,47 @@ class Response():
             self._content = b""
         
         content_length = len(self._content)
-        
-        # Build response headers (not request headers!)
-        headers = {
+        status_code = int(self.status_code) if self.status_code is not None else 200
+        reason = self.reason
+        if not reason:
+            try:
+                reason = http.HTTPStatus(status_code).phrase
+            except ValueError:
+                reason = "OK" if 200 <= status_code < 300 else "Status"
+
+        # Default response headers
+        default_headers = {
             "Cache-Control": "no-cache",
-            "Content-Type": "{}".format(self.headers.get('Content-Type', 'text/html')),
+            "Content-Type": "text/html",
             "Content-Length": "{}".format(content_length),
-            "Date": "{}".format(datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")),
+            "Date": "{}".format(datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")),
             "Connection": "close",
             "Server": "Streaprous/1.0",
         }
-        
-        # Build HTTP response header string
-        status_line = "HTTP/1.1 200 OK\r\n"
+
+        # Merge self.headers (case-insensitively overriding defaults)
+        custom_headers = getattr(self, 'headers', None) or {}
+        override_keys = {str(k).lower() for k in custom_headers}
+
         header_lines = []
-        for key, value in headers.items():
-            header_lines.append("{}: {}".format(key, value))
+        for key, value in default_headers.items():
+            if key.lower() not in override_keys:
+                header_lines.append("{}: {}".format(key, value))
+
+        for key, value in custom_headers.items():
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    header_lines.append("{}: {}".format(key, item))
+            else:
+                header_lines.append("{}: {}".format(key, value))
+
+        # Emit Set-Cookie headers from self.cookies (readable by document.cookie)
+        cookies = getattr(self, 'cookies', None) or {}
+        for key, value in cookies.items():
+            header_lines.append("Set-Cookie: {}={}; Path=/".format(key, value))
+
+        # Build HTTP response header string
+        status_line = "HTTP/1.1 {} {}\r\n".format(status_code, reason)
         header_str = status_line + "\r\n".join(header_lines) + "\r\n\r\n"
         
         return header_str.encode('utf-8')

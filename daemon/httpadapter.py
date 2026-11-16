@@ -25,7 +25,11 @@ from .response import Response
 from .dictionary import CaseInsensitiveDict
 
 import asyncio
+import base64
+import datetime
+import http
 import inspect
+import json
 import time
 
 # Import streaprous raw connection functions
@@ -98,6 +102,154 @@ class HttpAdapter:
         self.conn_info = None
         #: raw socket for streaprous communication
         self.raw_socket = None
+        #: optional set/tuple of paths requiring authentication
+        self.protected_paths = set()
+        #: optional mapping {username: password} for Basic Auth validation
+        self.auth_users = None
+
+    def _detect_content_type(self, path, content):
+        """Infer an appropriate Content-Type header from the request path or body."""
+        clean_path = (path or "").split("?", 1)[0].lower()
+        if clean_path == "/" or clean_path.endswith((".html", ".htm")):
+            return "text/html; charset=utf-8"
+        if clean_path.endswith(".css"):
+            return "text/css"
+        if clean_path.endswith(".js"):
+            return "application/javascript"
+        if clean_path.endswith(".json"):
+            return "application/json"
+        if clean_path.endswith(".png"):
+            return "image/png"
+        if clean_path.endswith((".jpg", ".jpeg")):
+            return "image/jpeg"
+        if clean_path.endswith(".ico"):
+            return "image/x-icon"
+
+        stripped = content.lstrip() if isinstance(content, bytes) else b""
+        if stripped.startswith((b"{", b"[")):
+            return "application/json"
+        return "text/plain; charset=utf-8"
+
+    def _build_hook_response(self, req, resp, result):
+        """Serialize a route handler's return value into raw HTTP response bytes."""
+        status_code = 200
+        custom_headers = {}
+        body = result
+
+        if isinstance(result, tuple) and len(result) == 3:
+            raw_status, raw_headers, body = result
+            status_code = int(raw_status)
+            if raw_headers:
+                custom_headers = dict(raw_headers)
+
+        if isinstance(body, (dict, list)):
+            content = json.dumps(body).encode("utf-8")
+            default_ct = "application/json"
+        elif isinstance(body, bytes):
+            content = body
+            default_ct = self._detect_content_type(req.path, content)
+        elif body is None:
+            content = b""
+            default_ct = "text/plain; charset=utf-8"
+        elif isinstance(body, str):
+            content = body.encode("utf-8")
+            default_ct = self._detect_content_type(req.path, content)
+        else:
+            content = str(body).encode("utf-8")
+            default_ct = self._detect_content_type(req.path, content)
+
+        resp.status_code = status_code
+        resp.reason = None
+        resp._content = content
+
+        has_ct = any(str(k).lower() == "content-type" for k in custom_headers)
+        if not has_ct:
+            resp.headers["Content-Type"] = default_ct
+        for key, value in custom_headers.items():
+            resp.headers[key] = value
+
+        return resp.build_response_header(req) + content
+
+    def parse_basic_auth(self, req):
+        """Decode HTTP Basic Authorization header into (username, password) or None."""
+        headers = getattr(req, "headers", None) or {}
+        auth_header = ""
+        for k, v in headers.items():
+            if str(k).lower() == "authorization":
+                auth_header = v
+                break
+        if not auth_header or not auth_header.lower().startswith("basic "):
+            return None
+
+        encoded = auth_header.split(" ", 1)[1].strip()
+        try:
+            decoded = base64.b64decode(encoded).decode("utf-8")
+        except Exception:
+            return None
+
+        if ":" not in decoded:
+            return None
+        username, password = decoded.split(":", 1)
+        return username, password
+
+    def is_authenticated(self, req, valid_users=None):
+        """Check whether request carries a valid session cookie or Basic Auth header."""
+        cookies = self.extract_cookies(req)
+        if cookies.get("auth") == "true" or bool(cookies.get("session_id")):
+            return True
+
+        creds = self.parse_basic_auth(req)
+        if creds is None:
+            return False
+
+        username, password = creds
+        if valid_users is not None:
+            return bool(username) and valid_users.get(username) == password
+        return bool(username and password)
+
+    def _requires_auth(self, req):
+        """Determine whether the matched route or request path requires authentication."""
+        if req.hook and getattr(req.hook, "_require_auth", False):
+            return True
+        clean_path = (getattr(req, "path", "") or "").split("?", 1)[0]
+        return clean_path in getattr(self, "protected_paths", ())
+
+    def build_unauthorized_response(self, req=None, realm="CO3094 StreapRous", message="Unauthorized"):
+        """Build an HTTP 401 Unauthorized response with WWW-Authenticate Basic header."""
+        resp = Response()
+        resp.status_code = 401
+        resp.reason = "Unauthorized"
+        resp.headers["WWW-Authenticate"] = f'Basic realm="{realm}"'
+        resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+        resp._content = message.encode("utf-8") if isinstance(message, str) else message
+        return resp.build_response_header(req) + resp._content
+
+    def _recv_http_request(self, conn):
+        """Read a full HTTP/1.1 request including its Content-Length body."""
+        buffer = b""
+        while b"\r\n\r\n" not in buffer:
+            chunk = conn.recv(65535)
+            if not chunk:
+                return buffer
+            buffer += chunk
+
+        header_part, body_part = buffer.split(b"\r\n\r\n", 1)
+        content_length = 0
+        for line in header_part.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"content-length:"):
+                try:
+                    content_length = max(0, int(line.split(b":", 1)[1].strip()))
+                except ValueError:
+                    content_length = 0
+                break
+
+        while len(body_part) < content_length:
+            chunk = conn.recv(min(65535, content_length - len(body_part)))
+            if not chunk:
+                break
+            body_part += chunk
+
+        return header_part + b"\r\n\r\n" + body_part
 
     def handle_client(self, conn, addr, routes):
         """
@@ -122,24 +274,22 @@ class HttpAdapter:
         resp = self.response
 
         # Handle the request
-        msg = conn.recv(1024).decode()
+        raw_msg = self._recv_http_request(conn)
+        if not raw_msg:
+            conn.close()
+            return
+        msg = raw_msg.decode("utf-8", errors="replace")
         req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
 
-        # Handle request hook
+        # Handle request hook and authentication
         response = b""
         try:
-            if req.hook:
-                #
-                # TODO: handle for App hook here
-                #
-                import json
+            if self._requires_auth(req) and not self.is_authenticated(req, self.auth_users):
+                response = self.build_unauthorized_response(req)
+            elif req.hook:
                 result = req.hook(headers=req.headers, body=req.body)
-                body_str = json.dumps(result) if isinstance(result, (dict, list)) else str(result)
-                content = body_str.encode('utf-8')
-                resp.headers['Content-Type'] = 'application/json'
-                resp._content = content
-                response = resp.build_response_header(req) + content
+                response = self._build_hook_response(req, resp, result)
             else:
                 # Build response
                 response = resp.build_response(req)
@@ -181,18 +331,12 @@ class HttpAdapter:
         msg = data.decode("utf-8")
         req.prepare(msg, routes)
         
-        # Handle request hook
-        if req.hook:
-            #
-            # TODO: handle for App hook here
-            #
-            import json
+        # Handle request hook and authentication
+        if self._requires_auth(req) and not self.is_authenticated(req, self.auth_users):
+            response = self.build_unauthorized_response(req)
+        elif req.hook:
             result = req.hook(headers=req.headers, body=req.body)
-            body_str = json.dumps(result) if isinstance(result, (dict, list)) else str(result)
-            content = body_str.encode('utf-8')
-            resp.headers['Content-Type'] = 'application/json'
-            resp._content = content
-            response = resp.build_response_header(req) + content
+            response = self._build_hook_response(req, resp, result)
         else:
             # Build response - returns bytes
             response = resp.build_response(req)
@@ -232,27 +376,26 @@ class HttpAdapter:
         # Response handler
         resp = self.response
 
-        print("[HttpAdapter] Invoke handle_client_coroutine connection {})".format(addr))
         addr = writer.get_extra_info("peername")
+        print("[HttpAdapter] Invoke handle_client_coroutine connection {})".format(addr))
 
         # TODO Handle the request asynchronously
-        msg = await reader.read(1024)
+        msg = await reader.read(65535)
+        if not msg:
+            writer.close()
+            return
 
+        req.prepare(msg.decode("utf-8", errors="replace"), routes=self.routes or {})
 
-        req.prepare(msg.decode("utf-8"), routes={})
-
-        # Handle request hook
-        if req.hook:
-            #
-            # TODO: handle for App hook here
-            #
-            import json
-            result = req.hook(headers=req.headers, body=req.body)
-            body_str = json.dumps(result) if isinstance(result, (dict, list)) else str(result)
-            content = body_str.encode('utf-8')
-            resp.headers['Content-Type'] = 'application/json'
-            resp._content = content
-            response = resp.build_response_header(req) + content
+        # Handle request hook and authentication
+        if self._requires_auth(req) and not self.is_authenticated(req, self.auth_users):
+            response = self.build_unauthorized_response(req)
+        elif req.hook:
+            if inspect.iscoroutinefunction(req.hook):
+                result = await req.hook(headers=req.headers, body=req.body)
+            else:
+                result = req.hook(headers=req.headers, body=req.body)
+            response = self._build_hook_response(req, resp, result)
         else:
             # Build response
             #print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
@@ -262,22 +405,28 @@ class HttpAdapter:
         writer.write(response)
         await writer.drain()
 
-    @property
-    def extract_cookies(self, req, resp):
+    def extract_cookies(self, req):
         """
-        Build cookies from the :class:`Request <Request>` headers.
+        Build cookies from the :class:`Request <Request>` headers or parsed cookies.
 
-        :param req:(Request) The :class:`Request <Request>` object.
-        :param resp: (Response) The res:class:`Response <Response>` object.
-        :rtype: cookies - A dictionary of cookie key-value pairs.
+        :param req: (Request) The :class:`Request <Request>` object.
+        :rtype: dict - A dictionary of cookie key-value pairs.
         """
+        if getattr(req, "cookies", None):
+            return dict(req.cookies)
+
         cookies = {}
-        for header in headers:
-            if header.startswith("Cookie:"):
-                cookie_str = header.split(":", 1)[1].strip()
-                for pair in cookie_str.split(";"):
-                    key, value = pair.strip().split("=")
-                    cookies[key] = value
+        headers = getattr(req, "headers", None) or {}
+        cookie_str = ""
+        for k, v in headers.items():
+            if str(k).lower() == "cookie":
+                cookie_str = v
+                break
+        if cookie_str:
+            for pair in cookie_str.split(";"):
+                if "=" in pair:
+                    key, value = pair.strip().split("=", 1)
+                    cookies[key.strip()] = value.strip()
         return cookies
 
     def build_response(self, req, resp):
@@ -300,7 +449,7 @@ class HttpAdapter:
             response.url = req.url
 
         # Add new cookies from the server.
-        response.cookies = extract_cookies(req)
+        response.cookies = self.extract_cookies(req)
 
         # Give the Response some context.
         response.request = req

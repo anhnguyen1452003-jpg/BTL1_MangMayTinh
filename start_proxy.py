@@ -74,11 +74,15 @@ def parse_virtual_hosts(config_file):
         proxy_map[host] = map
 
         # Find dist_policy if present
-        policy_match = re.search(r'dist_policy\s+(\w+)', block)
+        policy_match = re.search(r'dist_policy\s+([\w-]+)', block)
         if policy_match:
             dist_policy_map = policy_match.group(1)
         else: #default policy is round_robin
             dist_policy_map = 'round-robin'
+
+        # Find proxy_set_header directives if present
+        set_header_matches = re.findall(r'proxy_set_header\s+([^\s;]+)\s+([^;]+);', block)
+        set_headers = {name.strip(): val.strip() for name, val in set_header_matches}
             
         #
         # @bksysnet: Build the mapping and policy
@@ -88,13 +92,12 @@ def parse_virtual_hosts(config_file):
         #       the policy is applied to identify the highes matching
         #       proxy_pass
         #
-        if len(proxy_map.get(host,[])) == 1:
-            routes[host] = (proxy_map.get(host,[])[0], dist_policy_map)
-        elif len(proxy_map.get(host,[])) > 1:
-            # TODO: apply further policy matching here
-            routes[host] = (proxy_map.get(host,[]), dist_policy_map)
+        target_list = proxy_map.get(host, [])
+        target_value = target_list[0] if len(target_list) == 1 else target_list
+        if set_headers:
+            routes[host] = (target_value, dist_policy_map, set_headers)
         else:
-            routes[host] = (proxy_map.get(host,[]), dist_policy_map)
+            routes[host] = (target_value, dist_policy_map)
 
     for key, value in routes.items():
         print(key, value)

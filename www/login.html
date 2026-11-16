@@ -1,8 +1,178 @@
-<html><body>
-<h1>Login</h1>
-<form method="POST" action="/login">
-  Username: <input name="username" type="text"><br>
-  Password: <input name="password" type="password"><br>
-  <input type="submit" value="Login">
-</form>
-</body></html>
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Đăng nhập - CO3094 P2P Chat</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+  <div class="modal-overlay">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="brand-logo">P2P</div>
+        <h1>CO3094 StreapRous Chat</h1>
+        <p class="login-subtitle">
+          Đăng nhập vào Peer Node cục bộ để tham gia mạng P2P
+        </p>
+      </div>
+
+      <form id="loginPageForm" class="login-form" autocomplete="off">
+        <div class="form-group">
+          <label for="usernameInput">Username</label>
+          <input
+            type="text"
+            id="usernameInput"
+            name="username"
+            placeholder="Ví dụ: alice"
+            required
+          >
+        </div>
+
+        <div class="form-group">
+          <label for="passwordInput">Password</label>
+          <input
+            type="password"
+            id="passwordInput"
+            name="password"
+            placeholder="Nhập mật khẩu"
+            required
+          >
+        </div>
+
+        <div class="form-group">
+          <label for="p2pPortInput">P2P Port (Peer hiện tại)</label>
+          <input
+            type="number"
+            id="p2pPortInput"
+            name="p2p_port"
+            placeholder="Ví dụ: 9001"
+            min="1"
+            max="65535"
+          >
+        </div>
+
+        <p id="loginPageError" class="error-text hidden" role="alert"></p>
+
+        <button
+          type="submit"
+          id="loginPageSubmitBtn"
+          class="btn btn-primary btn-block"
+        >
+          Đăng nhập
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      const form = document.getElementById("loginPageForm");
+      const usernameInput = document.getElementById("usernameInput");
+      const passwordInput = document.getElementById("passwordInput");
+      const p2pPortInput = document.getElementById("p2pPortInput");
+      const errorEl = document.getElementById("loginPageError");
+      const submitBtn = document.getElementById("loginPageSubmitBtn");
+
+      async function preloadPeerInfo() {
+        try {
+          const resp = await fetch("/peer-info/", { credentials: "same-origin" });
+          if (!resp.ok) {
+            return;
+          }
+          const info = await resp.json();
+          if (info.status === "success" && info.p2p_port && !p2pPortInput.value) {
+            p2pPortInput.value = String(info.p2p_port);
+          }
+        } catch (err) {
+          console.warn("Unable to preload peer-info:", err);
+        }
+      }
+
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        errorEl.classList.add("hidden");
+
+        const username = usernameInput.value.trim();
+        const password = passwordInput.value;
+        const portRaw = p2pPortInput.value.trim();
+
+        if (!username || !password) {
+          errorEl.textContent = "Vui lòng nhập đầy đủ Username và Password.";
+          errorEl.classList.remove("hidden");
+          return;
+        }
+
+        const payload = {
+          username: username,
+          password: password,
+        };
+
+        if (portRaw) {
+          const parsedPort = parseInt(portRaw, 10);
+          if (Number.isNaN(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+            errorEl.textContent = "P2P Port phải nằm trong khoảng 1 - 65535.";
+            errorEl.classList.remove("hidden");
+            return;
+          }
+          payload.p2p_port = parsedPort;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Đang đăng nhập...";
+
+        try {
+          const resp = await fetch("/login/", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+
+          const data = await resp.json();
+          if (!resp.ok || data.status !== "success") {
+            errorEl.textContent = data.message || "Đăng nhập thất bại.";
+            errorEl.classList.remove("hidden");
+            return;
+          }
+
+          const finalUser = data.username || username;
+          sessionStorage.setItem("username", finalUser);
+          if (data.p2p_ip) {
+            sessionStorage.setItem("p2p_ip", String(data.p2p_ip));
+          }
+          if (data.p2p_port || payload.p2p_port) {
+            sessionStorage.setItem(
+              "p2p_port",
+              String(data.p2p_port || payload.p2p_port)
+            );
+          }
+
+          // Track whether the server issued a JS-readable session cookie
+          if (
+            resp.headers.get("Set-Cookie") ||
+            (document.cookie && document.cookie.trim().length > 0)
+          ) {
+            sessionStorage.setItem("require_cookie", "1");
+          } else {
+            sessionStorage.removeItem("require_cookie");
+          }
+
+          window.location.replace("/index.html");
+        } catch (err) {
+          errorEl.textContent = "Không thể kết nối tới Peer Node cục bộ.";
+          errorEl.classList.remove("hidden");
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Đăng nhập";
+        }
+      });
+
+      preloadPeerInfo();
+      usernameInput.focus();
+    })();
+  </script>
+</body>
+</html>
