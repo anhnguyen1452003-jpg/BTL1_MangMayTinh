@@ -2,7 +2,7 @@
   "use strict";
 
   const BASE_TITLE = "CO3094 P2P Chat";
-  const PEERS_POLL_MS = 3000;
+  const PEERS_POLL_MS = 2000;
   const MESSAGES_POLL_MS = 1500;
 
   const state = {
@@ -234,6 +234,55 @@
     return null;
   }
 
+  function isPeerConnected(peerKey) {
+    const connKeys = Object.keys(state.connectedPeers);
+    for (let i = 0; i < connKeys.length; i += 1) {
+      const entry = state.connectedPeers[connKeys[i]];
+      if (entry && (entry.username === peerKey || connKeys[i] === peerKey)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function updateComposerState() {
+    if (state.activeChannel.type === "global") {
+      messageInput.disabled = false;
+      if (fileInput) {
+        fileInput.disabled = false;
+      }
+      sendBtn.disabled = false;
+      messageInput.placeholder = "Nhập tin nhắn và nhấn Enter để gửi...";
+      activeChannelSubtitle.textContent =
+        "Gửi tin nhắn quảng bá và lưu trữ trên Tracker Server";
+      return;
+    }
+
+    const peerKey = state.activeChannel.id;
+    const connected = isPeerConnected(peerKey);
+    const endpoint = resolvePeerEndpoint(peerKey);
+    if (!connected) {
+      messageInput.disabled = true;
+      if (fileInput) {
+        fileInput.disabled = true;
+      }
+      sendBtn.disabled = true;
+      messageInput.placeholder = "Hãy bấm Connect ở Active Peers để chat với " + peerKey + "...";
+      activeChannelSubtitle.textContent =
+        "Chưa kết nối P2P — Bấm nút Connect để kết nối và đồng bộ tin nhắn với " + peerKey;
+    } else {
+      messageInput.disabled = false;
+      if (fileInput) {
+        fileInput.disabled = false;
+      }
+      sendBtn.disabled = false;
+      messageInput.placeholder = "Nhập tin nhắn và nhấn Enter để gửi...";
+      activeChannelSubtitle.textContent = endpoint
+        ? "Đã kết nối P2P 1-1 tới " + endpoint.ip + ":" + endpoint.port
+        : "Đã kết nối P2P 1-1";
+    }
+  }
+
   function isChannelActive(type, id) {
     return state.activeChannel.type === type && state.activeChannel.id === id;
   }
@@ -244,25 +293,22 @@
     if (type === "global") {
       state.unreadCounts.global = 0;
       activeChannelTitle.textContent = "# Global Broadcast";
-      activeChannelSubtitle.textContent =
-        "Gửi tin nhắn quảng bá trực tiếp tới toàn bộ peer đang online";
     } else {
       state.unreadCounts.private[id] = 0;
       if (!state.messages.private[id]) {
         state.messages.private[id] = [];
       }
-      const endpoint = resolvePeerEndpoint(id);
       activeChannelTitle.textContent = "@ " + id;
-      activeChannelSubtitle.textContent = endpoint
-        ? "Chat P2P 1-1 trực tiếp tới " + endpoint.ip + ":" + endpoint.port
-        : "Kênh chat riêng P2P 1-1";
     }
 
+    updateComposerState();
     updateTitleBlink();
     renderChannels();
     renderActivePeers();
     renderMessages(true);
-    messageInput.focus();
+    if (!messageInput.disabled) {
+      messageInput.focus();
+    }
   }
 
   function renderChannels() {
@@ -557,17 +603,11 @@
       const data = await response.json();
       if (data.status === "success") {
         state.activePeers = normalizePeersPayload(data.peers);
-        renderActivePeers();
-        if (state.activeChannel.type === "private") {
-          const endpoint = resolvePeerEndpoint(state.activeChannel.id);
-          if (endpoint) {
-            activeChannelSubtitle.textContent =
-              "Chat P2P 1-1 trực tiếp tới " +
-              endpoint.ip +
-              ":" +
-              endpoint.port;
-          }
+        if (data.connected_peers && typeof data.connected_peers === "object") {
+          state.connectedPeers = data.connected_peers;
         }
+        renderActivePeers();
+        updateComposerState();
       }
     } catch (err) {
       console.error("Failed to fetch peer list:", err);
@@ -637,9 +677,13 @@
       }
       state.messages.private = mergedPrivate;
       state.initialMessagesLoaded = true;
+      if (data.connected_peers && typeof data.connected_peers === "object") {
+        state.connectedPeers = data.connected_peers;
+      }
 
       renderChannels();
       renderActivePeers();
+      updateComposerState();
       updateTitleBlink();
       if (hasActiveChannelUpdate) {
         renderMessages(false);
@@ -669,9 +713,12 @@
         if (!state.messages.private[username]) {
           state.messages.private[username] = [];
         }
-        showToast("Đã kết nối TCP tới " + username + " (" + ip + ":" + port + ")", false);
+        showToast("Đã kết nối & đồng bộ P2P tới " + username + " (" + ip + ":" + port + ")", false);
+        await fetchMessages();
         renderChannels();
         renderActivePeers();
+        updateComposerState();
+        renderMessages(true);
       } else {
         showToast(data.message || "Không thể kết nối tới peer", true);
         buttonEl.disabled = false;

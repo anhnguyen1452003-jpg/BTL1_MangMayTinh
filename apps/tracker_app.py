@@ -18,14 +18,20 @@ Tracker RESTful application for peer discovery and registration built on
 the StreapRous framework using only the Python standard library.
 """
 
+import base64
+import binascii
+from datetime import datetime, timezone
+import hashlib
 import json
+import os
 import threading
 import time
+import urllib.parse
 import uuid
 
 from daemon import StreapRous
 
-PEER_TIMEOUT_SECONDS = 60.0
+PEER_TIMEOUT_SECONDS = 5.0
 
 app = StreapRous()
 
@@ -46,6 +52,17 @@ _sessions_lock = threading.Lock()
 # {username: {"ip": str, "port": int, "last_seen": float}}
 _peers_lock = threading.Lock()
 _active_peers = {}
+
+# Thread-safe in-memory store for global chat messages & global files
+_global_lock = threading.Lock()
+_global_messages = []
+_global_msg_ids = set()
+_global_files = {}  # {file_id: {"file_id": str, "filename": str, ...}}
+
+
+def _utc_timestamp():
+    """Return current UTC ISO-8601 timestamp."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _json_response(payload):
@@ -179,6 +196,46 @@ def login(headers="guest", body="anonymous"):
         return _error_response(f"Internal server error: {exc}")
 
 
+@app.route("/logout/", methods=["POST"])
+def logout(headers="guest", body="anonymous"):
+    """Remove an active peer and session immediately when a user logs out."""
+    try:
+        data = _parse_json_body(body)
+        username = data.get("username")
+        session_id = data.get("session_id")
+
+        removed_user = None
+        if isinstance(session_id, str) and session_id.strip():
+            with _sessions_lock:
+                removed_user = ACTIVE_SESSIONS.pop(session_id.strip(), None)
+
+        target_user = (
+            username.strip()
+            if isinstance(username, str) and username.strip()
+            else removed_user
+        )
+        if target_user:
+            with _peers_lock:
+                _active_peers.pop(target_user, None)
+            with _sessions_lock:
+                stale_tokens = [
+                    tok for tok, uname in ACTIVE_SESSIONS.items()
+                    if uname == target_user
+                ]
+                for tok in stale_tokens:
+                    ACTIVE_SESSIONS.pop(tok, None)
+
+        return _json_response({
+            "status": "success",
+            "message": f"Logged out {target_user or 'guest'}",
+            "username": target_user,
+        })
+    except ValueError as exc:
+        return _error_response(str(exc))
+    except Exception as exc:
+        return _error_response(f"Internal server error: {exc}")
+
+
 @app.route("/submit-info/", methods=["POST"])
 def submit_info(headers="guest", body="anonymous"):
     """Register a new peer or refresh an existing peer's active info."""
@@ -268,6 +325,157 @@ def add_list(headers="guest", body="anonymous"):
         return _error_response(str(exc))
     except Exception as exc:
         return _error_response(f"Internal server error: {exc}")
+
+
+@app.route("/global-message/", methods=["POST"])
+def post_global_message(headers="guest", body="anonymous"):
+    """Store a global chat text message in the Tracker's memory cache."""
+    try:
+        data = _parse_json_body(body)
+        sender = data.get("sender")
+        content = data.get("content")
+        if not isinstance(sender, str) or not sender.strip():
+            return _error_response("Missing or invalid 'sender'")
+        if not isinstance(content, str) or not content.strip():
+            return _error_response("Missing or invalid 'content'")
+
+        msg_id = str(data.get("msg_id") or uuid.uuid4().hex).strip()
+        timestamp = str(data.get("timestamp") or _utc_timestamp())
+        entry = {
+            "msg_id": msg_id,
+            "type": "text",
+            "sender": sender.strip(),
+            "channel": "global",
+            "content": content,
+            "timestamp": timestamp,
+        }
+
+        with _global_lock:
+            if msg_id not in _global_msg_ids:
+                _global_msg_ids.add(msg_id)
+                _global_messages.append(entry)
+
+        return _json_response({
+            "status": "success",
+            "message": "Global message stored",
+            "message_entry": entry,
+        })
+    except ValueError as exc:
+        return _error_response(str(exc))
+    except Exception as exc:
+        return _error_response(f"Internal server error: {exc}")
+
+
+@app.route("/global-file/", methods=["POST"])
+def post_global_file(headers="guest", body="anonymous"):
+    """Store a global chat file and its metadata entry in the Tracker cache."""
+    try:
+        data = _parse_json_body(body)
+        sender = data.get("sender")
+        filename = data.get("filename")
+        raw_b64 = data.get("file_data_b64")
+        if not isinstance(sender, str) or not sender.strip():
+            return _error_response("Missing or invalid 'sender'")
+        if not isinstance(filename, str) or not filename.strip():
+            return _error_response("Missing or invalid 'filename'")
+        if not isinstance(raw_b64, str):
+            return _error_response("Missing or invalid 'file_data_b64'")
+
+        clean_b64 = raw_b64.split(",", 1)[1] if raw_b64.startswith("data:") and "," in raw_b64 else raw_b64
+        try:
+            raw_bytes = base64.b64decode(clean_b64.strip().encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            return _error_response(f"Invalid base64 payload: {exc}")
+
+        actual_sha = hashlib.sha256(raw_bytes).hexdigest()
+        expected_sha = str(data.get("sha256") or "").strip().lower()
+        if expected_sha and expected_sha != actual_sha:
+            return _error_response("Global file SHA-256 checksum mismatch")
+
+        file_id = str(data.get("file_id") or uuid.uuid4().hex).strip()
+        msg_id = str(data.get("msg_id") or f"file:{file_id}").strip()
+        clean_name = os.path.basename(filename.strip()) or "file.bin"
+        timestamp = str(data.get("timestamp") or _utc_timestamp())
+
+        file_record = {
+            "file_id": file_id,
+            "filename": clean_name,
+            "file_size": len(raw_bytes),
+            "sha256": actual_sha,
+            "sender": sender.strip(),
+            "timestamp": timestamp,
+            "file_data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+        }
+        entry = {
+            "msg_id": msg_id,
+            "type": "file",
+            "sender": sender.strip(),
+            "channel": "global",
+            "content": f"[File] {clean_name} ({len(raw_bytes)} bytes)",
+            "file_id": file_id,
+            "filename": clean_name,
+            "file_size": len(raw_bytes),
+            "sha256": actual_sha,
+            "download_url": f"/download-file/?file_id={file_id}",
+            "verified": True,
+            "timestamp": timestamp,
+        }
+
+        with _global_lock:
+            _global_files[file_id] = file_record
+            if msg_id not in _global_msg_ids:
+                _global_msg_ids.add(msg_id)
+                _global_messages.append(entry)
+
+        return _json_response({
+            "status": "success",
+            "message": "Global file stored",
+            "file_entry": entry,
+        })
+    except ValueError as exc:
+        return _error_response(str(exc))
+    except Exception as exc:
+        return _error_response(f"Internal server error: {exc}")
+
+
+@app.route("/global-history/", methods=["GET"])
+def get_global_history(headers="guest", body="anonymous"):
+    """Return all cached global chat messages and file entries for sync."""
+    with _global_lock:
+        snapshot = [dict(m) for m in _global_messages]
+
+    return _json_response({
+        "status": "success",
+        "count": len(snapshot),
+        "messages": snapshot,
+    })
+
+
+@app.route("/global-file/", methods=["GET"])
+def get_global_file(headers="guest", body="anonymous"):
+    """Return a cached global file payload by ``file_id``."""
+    query = ""
+    if isinstance(headers, dict):
+        query = headers.get("x-query-string", "")
+        if not query:
+            req_path = headers.get("x-request-path", "")
+            if "?" in req_path:
+                query = req_path.split("?", 1)[1]
+    params = urllib.parse.parse_qs(query, keep_blank_values=False)
+    file_id = (params.get("file_id") or [""])[0].strip()
+    if not file_id:
+        return (400, {"Content-Type": "application/json"}, _error_response("Missing file_id"))
+
+    with _global_lock:
+        rec = _global_files.get(file_id)
+
+    if not rec:
+        return (404, {"Content-Type": "application/json"}, _error_response("Global file not found"))
+
+    return _json_response({
+        "status": "success",
+        "file": dict(rec),
+    })
 
 
 def create_tracker_app(ip, port):

@@ -99,7 +99,7 @@ Open **3 separate terminals**:
 2. What happens automatically:
    - `start_backend.py` inserts an `iptables` rule to prevent the Linux kernel from sending `RST` packets during the userspace 3-way handshake:
      ```bash
-     iptables -A OUTPUT -p tcp --sport 9000 --tcp-flags RST RST -j DROP
+     sudo iptables -A OUTPUT -p tcp --sport 9000 --tcp-flags RST RST -j DROP
      ```
    - `daemon/backend.py` runs `run_backend()` using `streaprous_socket` (`SOCK_RAW`).
    - `run_conn_send()` segments payloads larger than `1400` bytes (MSS) so large HTML/CSS/JS files transmit without `Errno 90: Message too long`.
@@ -169,6 +169,21 @@ Open **3 separate terminals**:
   ```
 
 ---
+   - **Tìm chunk file**
+   ```bash
+   Tìm chunk file
+   (tcp.port == 9001 or tcp.port == 9002) and tcp.len > 1000
+   ```
+
+   - **Chỉ bắt đúng các sự kiện chính**
+   ```bash
+   tcp.port == 8000 and http and (http.request.uri contains "/login/" or http.request.uri contains "/global-message/" or http.request.uri contains "/global-file/")
+   ```
+
+   - **Lọc cổng Web UI (8081 / 8082) bỏ qua polling của trình duyệt**
+   ```bash
+   (tcp.port == 8081 or tcp.port == 8082) and http and (http.request.uri contains "/login/" or http.request.uri contains "/connect-peer/" or http.request.uri contains "/send-peer/" or http.request.uri contains "/broadcast-peer/" or http.request.uri contains "/send-file/" or http.request.uri contains "/download-file/" or http.request.uri contains "/logout/")
+   ```
 
 ## License
 

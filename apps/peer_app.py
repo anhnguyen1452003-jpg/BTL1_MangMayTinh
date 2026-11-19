@@ -41,8 +41,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOWNLOADS_ROOT = os.path.join(BASE_DIR, "downloads")
 SOCKET_TIMEOUT_SECONDS = 3.0
 FILE_SOCKET_TIMEOUT_SECONDS = 15.0
-HEARTBEAT_INTERVAL_SECONDS = 20.0
-FILE_CHUNK_SIZE = 16384
+HEARTBEAT_INTERVAL_SECONDS = 2.0
+FILE_CHUNK_SIZE = 680
 MAX_P2P_PAYLOAD_BYTES = 1048576
 
 app = StreapRous()
@@ -57,20 +57,86 @@ _config = {
     "tracker_url": "http://127.0.0.1:8000",
 }
 
-# Thread-safe state and append-only (immutable) message store
+# Thread-safe state and append-only (immutable) per-user message stores
 _state_lock = threading.Lock()
 _current_user = None
 _peer_sessions = {}  # {session_id: username}
-_has_unread = False
-_connected_peers = {}  # {"ip:port": {"ip": str, "port": int, "username": str}}
+_user_states = {}    # {username: isolated per-user state dict}
 _known_peers_cache = {}  # {username: {"ip": str, "port": int}}
-_messages_store = {
-    "global": [],   # Append-only list of global messages
-    "private": {},  # {peer_key: append-only list of 1-1 messages}
-}
-_incoming_files = {}     # {file_id: {"meta": dict, "chunks": {idx: bytes}}}
-_transfer_progress = {}  # {file_id: {"file_id": str, "filename": str, ...}}
-_downloaded_files = {}   # {file_id: {"filename": str, "filepath": str, ...}}
+_global_sync_lock = threading.Lock()
+
+
+def _new_user_state():
+    """Return a fresh, isolated per-user state dictionary."""
+    return {
+        "has_unread": False,
+        "connected_peers": {},
+        "messages_store": {"global": [], "private": {}},
+        "seen_global_ids": set(),
+        "seen_private_ids": {},
+        "previously_seen_peers": set(),
+        "initial_global_synced": False,
+        "incoming_files": {},
+        "transfer_progress": {},
+        "downloaded_files": {},
+    }
+
+
+def _save_active_user_state_locked():
+    """Persist currently bound containers into ``_user_states[_current_user]``."""
+    if not _current_user:
+        return
+    _user_states[_current_user] = {
+        "has_unread": _has_unread,
+        "connected_peers": _connected_peers,
+        "messages_store": _messages_store,
+        "seen_global_ids": _seen_global_ids,
+        "seen_private_ids": _seen_private_ids,
+        "previously_seen_peers": _previously_seen_peers,
+        "initial_global_synced": _initial_global_synced,
+        "incoming_files": _incoming_files,
+        "transfer_progress": _transfer_progress,
+        "downloaded_files": _downloaded_files,
+    }
+
+
+def _activate_user_state_locked(target_username):
+    """Save current user's state and bind isolated containers for ``target_username``."""
+    global _current_user, _has_unread, _connected_peers, _messages_store
+    global _seen_global_ids, _seen_private_ids, _previously_seen_peers
+    global _initial_global_synced, _incoming_files, _transfer_progress, _downloaded_files
+
+    _save_active_user_state_locked()
+    if target_username:
+        state = _user_states.setdefault(target_username, _new_user_state())
+        _current_user = target_username
+    else:
+        state = _new_user_state()
+        _current_user = None
+
+    _has_unread = state["has_unread"]
+    _connected_peers = state["connected_peers"]
+    _messages_store = state["messages_store"]
+    _seen_global_ids = state["seen_global_ids"]
+    _seen_private_ids = state["seen_private_ids"]
+    _previously_seen_peers = state["previously_seen_peers"]
+    _initial_global_synced = state["initial_global_synced"]
+    _incoming_files = state["incoming_files"]
+    _transfer_progress = state["transfer_progress"]
+    _downloaded_files = state["downloaded_files"]
+
+
+_initial_state = _new_user_state()
+_has_unread = _initial_state["has_unread"]
+_connected_peers = _initial_state["connected_peers"]
+_messages_store = _initial_state["messages_store"]
+_seen_global_ids = _initial_state["seen_global_ids"]
+_seen_private_ids = _initial_state["seen_private_ids"]
+_previously_seen_peers = _initial_state["previously_seen_peers"]
+_initial_global_synced = _initial_state["initial_global_synced"]
+_incoming_files = _initial_state["incoming_files"]
+_transfer_progress = _initial_state["transfer_progress"]
+_downloaded_files = _initial_state["downloaded_files"]
 
 _stop_event = threading.Event()
 _listener_stop_event = threading.Event()
@@ -316,34 +382,250 @@ def _resolve_peer_label(target_ip, target_port, fallback_name=None):
 
 
 def _append_message(channel, sender, content, timestamp, peer_key=None,
-                    mark_unread=False, extra=None):
+                    mark_unread=False, extra=None, expected_user=None):
     """
-    Append an immutable message record into ``_messages_store``.
-
-    Existing entries are never modified or deleted.
+    Append an immutable message record into ``_messages_store``,
+    deduplicating by ``msg_id``. Returns True if newly added.
     """
     global _has_unread
 
+    extra_dict = dict(extra) if isinstance(extra, dict) else {}
+    msg_id = str(extra_dict.get("msg_id") or uuid.uuid4().hex)
+
     entry = {
+        "msg_id": msg_id,
         "type": "text",
         "sender": str(sender),
         "channel": channel,
         "content": str(content),
         "timestamp": str(timestamp),
     }
-    if isinstance(extra, dict):
-        entry.update(extra)
+    entry.update(extra_dict)
+    entry["msg_id"] = msg_id
 
     with _state_lock:
+        if expected_user is not None and _current_user != expected_user:
+            return False
         if channel == "private":
             bucket_key = peer_key or str(sender)
+            seen = _seen_private_ids.setdefault(bucket_key, set())
+            if msg_id in seen:
+                return False
+            seen.add(msg_id)
             bucket = _messages_store["private"].setdefault(bucket_key, [])
             bucket.append(entry)
+            bucket.sort(key=lambda m: m.get("timestamp", ""))
         else:
+            if msg_id in _seen_global_ids:
+                return False
+            _seen_global_ids.add(msg_id)
             _messages_store["global"].append(entry)
+            _messages_store["global"].sort(key=lambda m: m.get("timestamp", ""))
 
         if mark_unread:
             _has_unread = True
+        return True
+
+
+def _is_peer_connected(target_ip, target_port, target_username=None):
+    """Check whether a direct P2P connection exists with the target peer."""
+    addr_key = f"{target_ip}:{target_port}"
+    with _state_lock:
+        conn_info = _connected_peers.get(addr_key)
+        if conn_info is not None:
+            conn_uname = conn_info.get("username")
+            if not target_username or ":" in target_username or conn_uname == target_username:
+                return True
+        if target_username and ":" not in target_username:
+            for info in _connected_peers.values():
+                if info.get("username") == target_username:
+                    return True
+    return False
+
+
+def _get_private_messages_snapshot(peer_key):
+    """Return a copy of cached private messages for ``peer_key``."""
+    with _state_lock:
+        return [dict(m) for m in _messages_store["private"].get(peer_key, [])]
+
+
+def _pull_private_file_from_peer(peer_ip, peer_port, file_id, target_username=None):
+    """Pull missing private file bytes from a connected peer during sync."""
+    if not peer_ip or not peer_port or not file_id:
+        return False
+    with _state_lock:
+        owner = _current_user
+    if not owner:
+        return False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(FILE_SOCKET_TIMEOUT_SECONDS)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.connect((peer_ip, int(peer_port)))
+        req_pkt = {
+            "type": "peer_file_pull",
+            "file_id": file_id,
+            "sender": owner,
+        }
+        if target_username and ":" not in str(target_username):
+            req_pkt["target_username"] = target_username
+        sock.sendall(encrypt_payload(json.dumps(req_pkt).encode("utf-8")))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0].strip()
+        if not line:
+            return False
+        reply = json.loads(decrypt_payload(line).decode("utf-8"))
+        if reply.get("type") != "peer_file_data" or not reply.get("found"):
+            return False
+        raw_bytes = base64.b64decode(reply["file_data_b64"].encode("ascii"), validate=True)
+        actual_sha = hashlib.sha256(raw_bytes).hexdigest()
+        expected_sha = str(reply.get("sha256") or "").lower()
+        if expected_sha and actual_sha != expected_sha:
+            return False
+        with _state_lock:
+            if _current_user != owner:
+                return False
+        _save_file_for_user(owner, file_id, reply.get("filename", "file.bin"), raw_bytes, actual_sha)
+        return True
+    except (OSError, ValueError, binascii.Error, json.JSONDecodeError):
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _merge_private_messages(peer_key, incoming_msgs, peer_ip=None, peer_port=None,
+                            mark_unread=True, expected_user=None):
+    """Merge missing private messages from a peer buffer into local cache."""
+    if not isinstance(incoming_msgs, list) or not peer_key:
+        return 0
+    if expected_user is None:
+        with _state_lock:
+            expected_user = _current_user
+    if not expected_user:
+        return 0
+    added = 0
+    for msg in incoming_msgs:
+        if not isinstance(msg, dict):
+            continue
+        msg_id = str(msg.get("msg_id") or "").strip()
+        if not msg_id:
+            continue
+        extra = {k: v for k, v in msg.items() if k not in ("sender", "channel", "content", "timestamp")}
+        extra["msg_id"] = msg_id
+        if msg.get("type") == "file" and msg.get("file_id"):
+            fid = str(msg["file_id"])
+            with _state_lock:
+                if _current_user != expected_user:
+                    return added
+                has_file = fid in _downloaded_files
+            if not has_file and peer_ip and peer_port:
+                _pull_private_file_from_peer(
+                    peer_ip, peer_port, fid, target_username=peer_key
+                )
+        inserted = _append_message(
+            channel="private",
+            sender=msg.get("sender") or peer_key,
+            content=msg.get("content", ""),
+            timestamp=msg.get("timestamp") or _utc_timestamp(),
+            peer_key=peer_key,
+            mark_unread=mark_unread,
+            extra=extra,
+            expected_user=expected_user,
+        )
+        if inserted:
+            added += 1
+    return added
+
+
+def _sync_global_from_tracker(mark_unread_new=True):
+    """Synchronize global chat messages and files from Tracker's memory cache."""
+    global _initial_global_synced
+
+    with _state_lock:
+        me = _current_user
+    if not me:
+        return False
+
+    with _global_sync_lock:
+        res = _tracker_request("/global-history/", method="GET")
+        if res.get("status") != "success":
+            return False
+
+        messages = res.get("messages", [])
+        if not isinstance(messages, list):
+            return False
+
+        with _state_lock:
+            if _current_user != me:
+                return False
+            owner = me
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            msg_id = str(msg.get("msg_id") or "").strip()
+            if not msg_id:
+                continue
+
+            with _state_lock:
+                already_seen = msg_id in _seen_global_ids
+            if already_seen:
+                continue
+
+            if msg.get("type") == "file" and msg.get("file_id"):
+                fid = str(msg["file_id"])
+                with _state_lock:
+                    has_file = fid in _downloaded_files
+                if not has_file:
+                    f_res = _tracker_request(f"/global-file/?file_id={urllib.parse.quote(fid)}", method="GET")
+                    file_rec = f_res.get("file") if f_res.get("status") == "success" else None
+                    if isinstance(file_rec, dict) and file_rec.get("file_data_b64"):
+                        try:
+                            raw_bytes = base64.b64decode(
+                                file_rec["file_data_b64"].encode("ascii"), validate=True
+                            )
+                            actual_sha = hashlib.sha256(raw_bytes).hexdigest()
+                            expected_sha = str(file_rec.get("sha256") or "").lower()
+                            if not expected_sha or actual_sha == expected_sha:
+                                _save_file_for_user(
+                                    owner,
+                                    fid,
+                                    file_rec.get("filename", msg.get("filename", "file.bin")),
+                                    raw_bytes,
+                                    actual_sha,
+                                )
+                        except (ValueError, binascii.Error):
+                            pass
+
+            extra = {k: v for k, v in msg.items() if k not in ("sender", "channel", "content", "timestamp")}
+            extra["msg_id"] = msg_id
+            should_unread = (
+                mark_unread_new
+                and _initial_global_synced
+                and msg.get("sender") != me
+            )
+            _append_message(
+                channel="global",
+                sender=msg.get("sender", "unknown"),
+                content=msg.get("content", ""),
+                timestamp=msg.get("timestamp") or _utc_timestamp(),
+                mark_unread=should_unread,
+                extra=extra,
+                expected_user=me,
+            )
+
+        with _state_lock:
+            if _current_user == me:
+                _initial_global_synced = True
+        return True
 
 
 def _safe_filename(raw_name):
@@ -405,16 +687,31 @@ def _parse_query_params(headers):
     return urllib.parse.parse_qs(query, keep_blank_values=False)
 
 
-def _send_p2p_frames(target_ip, target_port, packets, on_progress=None):
+def _recv_one_line(sock, buffer):
+    """Read bytes from ``sock`` until a newline-delimited frame is complete."""
+    while b"\n" not in buffer:
+        chunk = sock.recv(65536)
+        if not chunk:
+            line = buffer.strip()
+            return line, b""
+        buffer += chunk
+    line, rest = buffer.split(b"\n", 1)
+    return line.strip(), rest
+
+
+def _send_p2p_frames(target_ip, target_port, packets, on_progress=None, wait_ack=False):
     """
-    Encrypt and stream one or more JSON packets sequentially over a single
-    P2P TCP connection.
+    Encrypt and stream JSON packets sequentially over a single P2P TCP connection.
+    When ``wait_ack`` is True, waits for a receiver ``chunk_ack`` after each frame
+    so TCP packets are never coalesced and appear sequentially in Wireshark.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(FILE_SOCKET_TIMEOUT_SECONDS)
     try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.connect((target_ip, target_port))
         total = len(packets)
+        ack_buf = b""
         for idx, packet in enumerate(packets):
             raw_json = json.dumps(packet).encode("utf-8")
             encrypted = encrypt_payload(raw_json)
@@ -422,6 +719,19 @@ def _send_p2p_frames(target_ip, target_port, packets, on_progress=None):
                 preview = encrypted.decode("ascii", errors="replace").strip()[:30]
                 print(f"[P2P Security] Encrypted outgoing payload: {preview}...")
             sock.sendall(encrypted)
+            if wait_ack:
+                ack_line, ack_buf = _recv_one_line(sock, ack_buf)
+                if not ack_line:
+                    return False, f"Missing chunk ACK at frame {idx}"
+                try:
+                    ack_pkt = json.loads(decrypt_payload(ack_line).decode("utf-8"))
+                    ack_type = ack_pkt.get("type")
+                    if ack_type in ("peer_offline", "peer_mismatch"):
+                        return False, ack_pkt.get("error") or ack_type
+                    if ack_type != "chunk_ack":
+                        return False, f"Unexpected ACK type: {ack_type}"
+                except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    return False, f"Invalid chunk ACK: {exc}"
             if on_progress is not None:
                 on_progress(idx + 1, total)
         return True, None
@@ -440,15 +750,20 @@ def _send_p2p_packet(target_ip, target_port, packet):
 
     Returns ``(True, None)`` on success or ``(False, error_message)`` on error.
     """
-    return _send_p2p_frames(target_ip, target_port, [packet])
+    return _send_p2p_frames(target_ip, target_port, [packet], wait_ack=False)
 
 
-def _handle_incoming_file_packet(packet, addr):
+def _handle_incoming_file_packet(packet, addr, active_user=None):
     """Process ``file_meta``, ``file_chunk``, and ``file_end`` P2P packets."""
     pkt_type = packet.get("type")
     file_id = str(packet.get("file_id") or "").strip()
     if not file_id:
-        return
+        return "invalid"
+
+    with _state_lock:
+        owner = active_user or _current_user
+        if not owner or (active_user is not None and _current_user != active_user):
+            return "peer_offline"
 
     if pkt_type == "file_meta":
         filename = _safe_filename(packet.get("filename", "file.bin"))
@@ -459,8 +774,13 @@ def _handle_incoming_file_packet(packet, addr):
         channel = packet.get("channel", "private")
         if channel not in ("global", "private"):
             channel = "private"
+        expected_target = str(packet.get("target_username") or "").strip()
+        if channel == "private" and expected_target and ":" not in expected_target and expected_target != owner:
+            return "peer_mismatch"
 
         with _state_lock:
+            if _current_user != owner:
+                return "peer_offline"
             _incoming_files[file_id] = {
                 "meta": {
                     "file_id": file_id,
@@ -471,12 +791,14 @@ def _handle_incoming_file_packet(packet, addr):
                     "sender": sender,
                     "channel": channel,
                     "timestamp": packet.get("timestamp") or _utc_timestamp(),
+                    "owner": owner,
                 },
                 "chunks": {},
             }
         _update_transfer_progress(
             file_id, filename, "receive", 0, "receiving", False, file_size
         )
+        return "ok"
 
     elif pkt_type == "file_chunk":
         chunk_index = packet.get("chunk_index")
@@ -486,12 +808,14 @@ def _handle_incoming_file_packet(packet, addr):
             chunk_bytes = base64.b64decode(data_b64.encode("ascii"), validate=True)
         except (TypeError, ValueError, binascii.Error):
             print(f"[PeerFile] Invalid file chunk for {file_id}")
-            return
+            return "invalid"
 
         with _state_lock:
+            if _current_user != owner:
+                return "peer_offline"
             entry = _incoming_files.get(file_id)
             if not entry:
-                return
+                return "missing_meta"
             entry["chunks"][chunk_idx_int] = chunk_bytes
             total_chunks = max(1, entry["meta"]["total_chunks"])
             received = len(entry["chunks"])
@@ -502,13 +826,15 @@ def _handle_incoming_file_packet(packet, addr):
         _update_transfer_progress(
             file_id, filename, "receive", percent, "receiving", False, file_size
         )
+        return "ok"
 
     elif pkt_type == "file_end":
         with _state_lock:
             entry = _incoming_files.pop(file_id, None)
-            owner = _current_user or f"peer_{_config['p2p_port']}"
+            if _current_user != owner:
+                return "peer_offline"
         if not entry:
-            return
+            return "missing_meta"
 
         meta = entry["meta"]
         chunks = entry["chunks"]
@@ -521,7 +847,7 @@ def _handle_incoming_file_packet(packet, addr):
                 file_id, filename, "receive", 0, "error", False, meta["file_size"]
             )
             print(f"[PeerFile] Missing chunks for {filename} ({len(chunks)}/{total_chunks})")
-            return
+            return "error"
 
         assembled = b"".join(chunks[i] for i in range(total_chunks))
         actual_sha = hashlib.sha256(assembled).hexdigest()
@@ -530,7 +856,7 @@ def _handle_incoming_file_packet(packet, addr):
                 file_id, filename, "receive", 0, "checksum_mismatch", False, len(assembled)
             )
             print(f"[PeerFile] SHA-256 mismatch for {filename}: expected={expected_sha} actual={actual_sha}")
-            return
+            return "error"
 
         _save_file_for_user(owner, file_id, filename, assembled, actual_sha)
         _update_transfer_progress(
@@ -548,6 +874,7 @@ def _handle_incoming_file_packet(packet, addr):
             peer_key=str(sender),
             mark_unread=True,
             extra={
+                "msg_id": f"file:{file_id}",
                 "type": "file",
                 "file_id": file_id,
                 "filename": filename,
@@ -556,25 +883,171 @@ def _handle_incoming_file_packet(packet, addr):
                 "download_url": f"/download-file/?file_id={file_id}",
                 "verified": True,
             },
+            expected_user=owner,
         )
+        return "ok"
+    return "ok"
 
 
-def _process_decrypted_packet(packet, addr):
-    """Route a decrypted P2P JSON packet to file transfer or chat message store."""
+def _process_decrypted_packet(packet, addr, conn=None):
+    """Route a decrypted P2P JSON packet to sync, file transfer, or chat store."""
     if not isinstance(packet, dict):
         return
 
     pkt_type = packet.get("type", "chat")
+    with _state_lock:
+        active_user = _current_user
+        my_ip = _config["advertise_ip"]
+        my_port = _config["p2p_port"]
+
+    if pkt_type in ("peer_connect", "peer_sync"):
+        if not active_user:
+            if conn is not None:
+                reply = {
+                    "type": "peer_offline",
+                    "error": "Remote peer is logged out",
+                    "p2p_ip": my_ip,
+                    "p2p_port": my_port,
+                }
+                try:
+                    conn.sendall(encrypt_payload(json.dumps(reply).encode("utf-8")))
+                except OSError:
+                    pass
+            return
+
+        sender = str(packet.get("sender") or "").strip()
+        expected_target = str(packet.get("target_username") or "").strip()
+        peer_ip = str(packet.get("p2p_ip") or addr[0]).strip()
+        try:
+            peer_port = _validate_port(packet.get("p2p_port"))
+        except ValueError:
+            peer_port = addr[1]
+
+        if (expected_target and ":" not in expected_target and expected_target != active_user) or (
+            sender and sender == active_user
+        ):
+            if conn is not None:
+                reply = {
+                    "type": "peer_mismatch",
+                    "sender": active_user,
+                    "p2p_ip": my_ip,
+                    "p2p_port": my_port,
+                    "error": f"Active user on port is {active_user}",
+                }
+                try:
+                    conn.sendall(encrypt_payload(json.dumps(reply).encode("utf-8")))
+                except OSError:
+                    pass
+            return
+
+        if sender:
+            addr_key = f"{peer_ip}:{peer_port}"
+            with _state_lock:
+                if _current_user != active_user:
+                    return
+                _connected_peers[addr_key] = {
+                    "ip": peer_ip,
+                    "port": peer_port,
+                    "username": sender,
+                    "connected_at": _utc_timestamp(),
+                }
+            _merge_private_messages(
+                sender,
+                packet.get("messages", []),
+                peer_ip=peer_ip,
+                peer_port=peer_port,
+                mark_unread=(pkt_type == "peer_sync"),
+                expected_user=active_user,
+            )
+            with _state_lock:
+                if _current_user != active_user:
+                    return
+            my_msgs = _get_private_messages_snapshot(sender)
+            if conn is not None:
+                reply = {
+                    "type": f"{pkt_type}_ack",
+                    "sender": active_user,
+                    "p2p_ip": my_ip,
+                    "p2p_port": my_port,
+                    "messages": my_msgs,
+                }
+                try:
+                    conn.sendall(encrypt_payload(json.dumps(reply).encode("utf-8")))
+                except OSError:
+                    pass
+        return
+
+    if pkt_type == "peer_file_pull":
+        file_id = str(packet.get("file_id") or "").strip()
+        expected_target = str(packet.get("target_username") or "").strip()
+        reply = {"type": "peer_file_data", "found": False, "file_id": file_id}
+        if active_user and (
+            not expected_target or ":" in expected_target or expected_target == active_user
+        ):
+            with _state_lock:
+                rec = _downloaded_files.get(file_id) if _current_user == active_user else None
+            if rec and os.path.isfile(rec["filepath"]):
+                try:
+                    with open(rec["filepath"], "rb") as f_obj:
+                        raw_bytes = f_obj.read()
+                    reply = {
+                        "type": "peer_file_data",
+                        "found": True,
+                        "file_id": file_id,
+                        "filename": rec["filename"],
+                        "sha256": rec["sha256"],
+                        "file_data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    }
+                except OSError:
+                    pass
+        if conn is not None:
+            try:
+                conn.sendall(encrypt_payload(json.dumps(reply).encode("utf-8")))
+            except OSError:
+                pass
+        return
+
     if pkt_type in ("file_meta", "file_chunk", "file_end"):
-        _handle_incoming_file_packet(packet, addr)
+        if not active_user:
+            status = "peer_offline"
+        else:
+            status = _handle_incoming_file_packet(packet, addr, active_user=active_user)
+        if conn is not None:
+            if status in ("peer_offline", "peer_mismatch"):
+                ack_pkt = {
+                    "type": status,
+                    "file_id": packet.get("file_id"),
+                    "chunk_index": packet.get("chunk_index"),
+                    "error": "Remote peer unavailable or user changed",
+                }
+            else:
+                ack_pkt = {
+                    "type": "chunk_ack",
+                    "file_id": packet.get("file_id"),
+                    "chunk_index": packet.get("chunk_index"),
+                }
+            try:
+                conn.sendall(encrypt_payload(json.dumps(ack_pkt).encode("utf-8")))
+            except OSError:
+                pass
+        return
+
+    if not active_user:
         return
 
     sender = packet.get("sender") or f"{addr[0]}:{addr[1]}"
     channel = packet.get("channel", "global")
     if channel not in ("global", "private"):
         channel = "global"
+    if channel == "private":
+        expected_target = str(packet.get("target_username") or "").strip()
+        if expected_target and ":" not in expected_target and expected_target != active_user:
+            return
     content = packet.get("content", "")
     timestamp = packet.get("timestamp") or _utc_timestamp()
+    extra = {}
+    if packet.get("msg_id"):
+        extra["msg_id"] = str(packet["msg_id"])
 
     _append_message(
         channel=channel,
@@ -583,12 +1056,18 @@ def _process_decrypted_packet(packet, addr):
         timestamp=timestamp,
         peer_key=str(sender),
         mark_unread=True,
+        extra=extra,
+        expected_user=active_user,
     )
 
 
 def _handle_p2p_client(conn, addr):
     """Receive, verify, decrypt, and dispatch P2P frames from a connected peer."""
     conn.settimeout(FILE_SOCKET_TIMEOUT_SECONDS)
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     byte_buffer = b""
 
     try:
@@ -621,7 +1100,7 @@ def _handle_p2p_client(conn, addr):
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     print(f"[PeerP2P] Ignored invalid JSON from {addr}")
                     continue
-                _process_decrypted_packet(packet, addr)
+                _process_decrypted_packet(packet, addr, conn=conn)
 
         # Process trailing line if sender closed socket without trailing newline
         trailing = byte_buffer.strip()
@@ -630,7 +1109,7 @@ def _handle_p2p_client(conn, addr):
                 decrypted_bytes = decrypt_payload(trailing)
                 print("[P2P Security] Decrypted incoming payload verified via HMAC-SHA256")
                 packet = json.loads(decrypted_bytes.decode("utf-8"))
-                _process_decrypted_packet(packet, addr)
+                _process_decrypted_packet(packet, addr, conn=conn)
             except ValueError as exc:
                 print(f"[P2P Security] Rejected invalid/tampered payload from {addr}: {exc}")
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -730,8 +1209,93 @@ def _restart_p2p_listener(new_port):
             raise ValueError(f"Cannot bind P2P port {new_port}: {error_holder[0]}")
 
 
+def _sync_with_peer_endpoint(target_ip, target_port, peer_username, req_type="peer_sync"):
+    """
+    Connect to ``(target_ip, target_port)``, push local private messages for
+    ``peer_username``, and merge the peer's cached private messages back.
+    """
+    with _state_lock:
+        if not _current_user:
+            return False, None, "Not logged in"
+        my_name = _current_user
+        my_ip = _config["advertise_ip"]
+        my_port = _config["p2p_port"]
+
+    addr_key = f"{target_ip}:{target_port}"
+    my_msgs = _get_private_messages_snapshot(peer_username)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(FILE_SOCKET_TIMEOUT_SECONDS)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.connect((target_ip, int(target_port)))
+        req_pkt = {
+            "type": req_type,
+            "sender": my_name,
+            "p2p_ip": my_ip,
+            "p2p_port": my_port,
+            "messages": my_msgs,
+            "timestamp": _utc_timestamp(),
+        }
+        if peer_username and ":" not in str(peer_username):
+            req_pkt["target_username"] = str(peer_username)
+        sock.sendall(encrypt_payload(json.dumps(req_pkt).encode("utf-8")))
+        line, _ = _recv_one_line(sock, b"")
+        if not line:
+            return False, None, "Empty sync reply from peer"
+        reply = json.loads(decrypt_payload(line).decode("utf-8"))
+        reply_type = reply.get("type")
+        if reply_type in ("peer_offline", "peer_mismatch"):
+            with _state_lock:
+                if _current_user == my_name:
+                    _connected_peers.pop(addr_key, None)
+            return False, None, reply.get("error") or reply_type
+
+        remote_name = str(reply.get("sender") or "").strip()
+        if not remote_name:
+            return False, None, "Missing sender identity in peer reply"
+        if peer_username and ":" not in str(peer_username) and remote_name != peer_username:
+            with _state_lock:
+                if _current_user == my_name:
+                    _connected_peers.pop(addr_key, None)
+            return False, None, f"Peer identity mismatch: expected {peer_username}, got {remote_name}"
+
+        with _state_lock:
+            if _current_user != my_name:
+                return False, None, "Local session changed during sync"
+
+        _merge_private_messages(
+            remote_name,
+            reply.get("messages", []),
+            peer_ip=target_ip,
+            peer_port=target_port,
+            mark_unread=(req_type == "peer_sync"),
+            expected_user=my_name,
+        )
+        return True, remote_name, None
+    except (socket.timeout, OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return False, None, str(exc)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _sync_connected_peers():
+    """Periodically synchronize private buffers with all currently connected peers."""
+    with _state_lock:
+        if not _current_user:
+            return
+        targets = [
+            (info["ip"], info["port"], info.get("username") or addr_key)
+            for addr_key, info in _connected_peers.items()
+        ]
+    for ip, port, uname in targets:
+        _sync_with_peer_endpoint(ip, port, uname, req_type="peer_sync")
+
+
 def _heartbeat_loop():
-    """Periodically send POST /submit-info/ heartbeat every 20 seconds."""
+    """Periodically send heartbeat every 2s and sync global/private caches."""
     while not _stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
         with _state_lock:
             username = _current_user
@@ -748,6 +1312,9 @@ def _heartbeat_loop():
                                   payload=payload)
         if result.get("status") != "success":
             print(f"[PeerHeartbeat] Failed to refresh info: {result}")
+        else:
+            _sync_global_from_tracker(mark_unread_new=True)
+            _sync_connected_peers()
 
 
 def _start_background_services():
@@ -911,8 +1478,16 @@ def login(headers="guest", body="anonymous"):
             or uuid.uuid4().hex
         )
         with _state_lock:
-            _current_user = username
+            if _current_user != username:
+                _connected_peers.clear()
+            stale_tokens = [tok for tok, uname in _peer_sessions.items() if uname != username]
+            for tok in stale_tokens:
+                _peer_sessions.pop(tok, None)
+            _activate_user_state_locked(username)
             _peer_sessions[session_id] = username
+
+        # Sync existing global chat history & files immediately when connecting
+        _sync_global_from_tracker(mark_unread_new=False)
 
         set_cookies = list(tracker_set_cookies)
         if not any("session_id=" in c for c in set_cookies):
@@ -944,17 +1519,32 @@ def login(headers="guest", body="anonymous"):
 @app.route("/logout/", methods=["POST", "GET"])
 def logout(headers="guest", body="anonymous"):
     """Invalidate the current session cookie and clear browser session cookies."""
-    global _current_user
-
     cookies = _extract_cookie_dict(headers)
     session_id = cookies.get("session_id", "").strip()
 
     with _state_lock:
         removed_user = _peer_sessions.pop(session_id, None) if session_id else None
-        if removed_user and _current_user == removed_user:
-            _current_user = None
-        elif not _peer_sessions:
-            _current_user = None
+        target_logout_user = removed_user or _current_user
+        if removed_user:
+            other_tokens = [
+                tok for tok, uname in _peer_sessions.items()
+                if uname == removed_user
+            ]
+            for tok in other_tokens:
+                _peer_sessions.pop(tok, None)
+        if not removed_user or _current_user == removed_user or not _peer_sessions:
+            _connected_peers.clear()
+            _activate_user_state_locked(None)
+
+    if target_logout_user or session_id:
+        try:
+            _tracker_request(
+                "/logout/",
+                method="POST",
+                payload={"username": target_logout_user, "session_id": session_id},
+            )
+        except Exception:
+            pass
 
     return (
         200,
@@ -987,7 +1577,28 @@ def get_list(headers="guest", body="anonymous"):
         with _state_lock:
             _known_peers_cache.clear()
             _known_peers_cache.update(peers_map)
+            _previously_seen_peers.update(peers_map.keys())
+            endpoint_owners = {
+                f"{pinfo['ip']}:{pinfo['port']}": puname
+                for puname, pinfo in peers_map.items()
+            }
+            stale_keys = [
+                addr_key
+                for addr_key, info in _connected_peers.items()
+                if (
+                    info.get("username") in _previously_seen_peers
+                    and info.get("username") not in peers_map
+                )
+                or (
+                    addr_key in endpoint_owners
+                    and info.get("username") != endpoint_owners[addr_key]
+                )
+            ]
+            for sk in stale_keys:
+                del _connected_peers[sk]
+            connected_snapshot = {k: dict(v) for k, v in _connected_peers.items()}
 
+        tracker_res["connected_peers"] = connected_snapshot
         return _json_response(tracker_res)
     except Exception as exc:
         return _error_response(f"Internal server error: {exc}")
@@ -995,8 +1606,9 @@ def get_list(headers="guest", body="anonymous"):
 
 @app.route("/connect-peer/", methods=["POST"])
 def connect_peer(headers="guest", body="anonymous"):
-    """Verify TCP reachability to a peer and save it in connected_peers."""
-    if not _is_session_valid(headers):
+    """Establish mutual P2P connection and synchronize both peers' private caches."""
+    session_user = _get_session_username(headers)
+    if session_user is None:
         return _unauthorized_response()
 
     try:
@@ -1007,39 +1619,38 @@ def connect_peer(headers="guest", body="anonymous"):
         target_ip = target_ip.strip()
         target_port = _validate_port(data.get("target_port"))
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(SOCKET_TIMEOUT_SECONDS)
-        try:
-            sock.connect((target_ip, target_port))
-        except (socket.timeout, OSError) as exc:
-            return _error_response(
-                f"Cannot connect to peer {target_ip}:{target_port}: {exc}"
-            )
-        finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
         peer_username = _resolve_peer_label(
             target_ip,
             target_port,
             data.get("username"),
         )
+        ok, remote_name, err = _sync_with_peer_endpoint(
+            target_ip,
+            target_port,
+            peer_username,
+            req_type="peer_connect",
+        )
+        if not ok:
+            return _error_response(
+                f"Cannot connect to peer {target_ip}:{target_port}: {err}"
+            )
+
+        final_username = remote_name or peer_username
         addr_key = f"{target_ip}:{target_port}"
         peer_record = {
             "ip": target_ip,
             "port": target_port,
-            "username": peer_username,
+            "username": final_username,
             "connected_at": _utc_timestamp(),
         }
 
         with _state_lock:
-            _connected_peers[addr_key] = peer_record
+            if _current_user == session_user:
+                _connected_peers[addr_key] = peer_record
 
         return _json_response({
             "status": "success",
-            "message": f"Connected to {addr_key}",
+            "message": f"Connected and synchronized with {final_username} ({addr_key})",
             "peer": peer_record,
         })
     except ValueError as exc:
@@ -1048,9 +1659,18 @@ def connect_peer(headers="guest", body="anonymous"):
         return _error_response(f"Internal server error: {exc}")
 
 
+@app.route("/sync-peer/", methods=["POST"])
+def sync_peer(headers="guest", body="anonymous"):
+    """Manually trigger bidirectional private message sync with connected peer(s)."""
+    if not _is_session_valid(headers):
+        return _unauthorized_response()
+    _sync_connected_peers()
+    return _json_response({"status": "success", "message": "Peer buffers synchronized"})
+
+
 @app.route("/send-peer/", methods=["POST"])
 def send_peer(headers="guest", body="anonymous"):
-    """Send a unicast P2P message over TCP and record it locally."""
+    """Send a unicast P2P message over TCP (requires active P2P connection)."""
     session_user = _get_session_username(headers)
     if session_user is None:
         return _unauthorized_response()
@@ -1067,16 +1687,30 @@ def send_peer(headers="guest", body="anonymous"):
         if not isinstance(content, str) or not content.strip():
             return _error_response("Missing or invalid 'content'")
 
+        peer_key = _resolve_peer_label(
+            target_ip,
+            target_port,
+            data.get("target_username"),
+        )
+        if not _is_peer_connected(target_ip, target_port, peer_key):
+            return _error_response(
+                f"Chưa kết nối P2P với {peer_key}. Hãy bấm Connect trước khi nhắn tin!"
+            )
+
         with _state_lock:
             sender = session_user or _current_user or data.get("sender") or "anonymous"
 
+        msg_id = uuid.uuid4().hex
         timestamp = _utc_timestamp()
         packet = {
+            "msg_id": msg_id,
             "sender": sender,
             "channel": "private",
             "content": content,
             "timestamp": timestamp,
         }
+        if peer_key and ":" not in str(peer_key):
+            packet["target_username"] = str(peer_key)
 
         ok, err = _send_p2p_packet(target_ip, target_port, packet)
         if not ok:
@@ -1084,11 +1718,6 @@ def send_peer(headers="guest", body="anonymous"):
                 f"Failed to send message to {target_ip}:{target_port}: {err}"
             )
 
-        peer_key = _resolve_peer_label(
-            target_ip,
-            target_port,
-            data.get("target_username"),
-        )
         _append_message(
             channel="private",
             sender=sender,
@@ -1096,6 +1725,8 @@ def send_peer(headers="guest", body="anonymous"):
             timestamp=timestamp,
             peer_key=peer_key,
             mark_unread=False,
+            extra={"msg_id": msg_id},
+            expected_user=sender,
         )
 
         return _json_response({
@@ -1112,7 +1743,7 @@ def send_peer(headers="guest", body="anonymous"):
 
 @app.route("/broadcast-peer/", methods=["POST"])
 def broadcast_peer(headers="guest", body="anonymous"):
-    """Broadcast a P2P message concurrently to all known/connected peers."""
+    """Store global message on Tracker server cache and broadcast to online peers."""
     session_user = _get_session_username(headers)
     if session_user is None:
         return _unauthorized_response()
@@ -1126,6 +1757,25 @@ def broadcast_peer(headers="guest", body="anonymous"):
         with _state_lock:
             sender = session_user or _current_user or data.get("sender") or "anonymous"
 
+        msg_id = uuid.uuid4().hex
+        timestamp = _utc_timestamp()
+
+        # Store global message in Tracker's memory cache so connecting peers sync it
+        tracker_post = _tracker_request(
+            "/global-message/",
+            method="POST",
+            payload={
+                "msg_id": msg_id,
+                "sender": sender,
+                "content": content,
+                "timestamp": timestamp,
+            },
+        )
+        if tracker_post.get("status") != "success":
+            return _error_response(
+                f"Tracker failed to store global message: {tracker_post.get('message', 'unknown error')}"
+            )
+
         # Refresh online list from tracker (best-effort)
         tracker_res = _tracker_request("/get-list/", method="GET")
         if tracker_res.get("status") == "success":
@@ -1138,7 +1788,7 @@ def broadcast_peer(headers="guest", body="anonymous"):
         targets = {}
         with _state_lock:
             for uname, info in _known_peers_cache.items():
-                if uname == _current_user:
+                if uname == sender:
                     continue
                 if (info["ip"] == _config["advertise_ip"]
                         and info["port"] == _config["p2p_port"]):
@@ -1153,8 +1803,8 @@ def broadcast_peer(headers="guest", body="anonymous"):
                     continue
                 targets[addr_key] = (info["ip"], info["port"])
 
-        timestamp = _utc_timestamp()
         packet = {
+            "msg_id": msg_id,
             "sender": sender,
             "channel": "global",
             "content": content,
@@ -1167,6 +1817,7 @@ def broadcast_peer(headers="guest", body="anonymous"):
             content=content,
             timestamp=timestamp,
             mark_unread=False,
+            extra={"msg_id": msg_id},
         )
 
         # Send to all target peers in parallel so one dead peer never blocks
@@ -1212,12 +1863,13 @@ def broadcast_peer(headers="guest", body="anonymous"):
 
 @app.route("/messages/", methods=["GET"])
 def get_messages(headers="guest", body="anonymous"):
-    """Return all global/private messages and unread status for UI polling."""
+    """Sync global history from Tracker and return all messages for UI polling."""
     global _has_unread
     if not _is_session_valid(headers):
         return _unauthorized_response()
 
     try:
+        _sync_global_from_tracker(mark_unread_new=True)
         with _state_lock:
             unread_flag = _has_unread
             _has_unread = False
@@ -1226,10 +1878,12 @@ def get_messages(headers="guest", body="anonymous"):
                 peer: [dict(msg) for msg in msgs]
                 for peer, msgs in _messages_store["private"].items()
             }
+            connected_snapshot = {k: dict(v) for k, v in _connected_peers.items()}
 
         return _json_response({
             "status": "success",
             "has_unread": unread_flag,
+            "connected_peers": connected_snapshot,
             "channels": {
                 "global": global_msgs,
                 "private": private_msgs,
@@ -1287,7 +1941,7 @@ def send_file(headers="guest", body="anonymous"):
         )
 
         # Build protocol frames: file_meta -> file_chunk(s) -> file_end
-        frames = [{
+        meta_frame = {
             "type": "file_meta",
             "file_id": file_id,
             "filename": filename,
@@ -1297,7 +1951,10 @@ def send_file(headers="guest", body="anonymous"):
             "sender": sender,
             "channel": channel,
             "timestamp": timestamp,
-        }]
+        }
+        if channel == "private" and target and ":" not in str(target):
+            meta_frame["target_username"] = str(target)
+        frames = [meta_frame]
         for idx in range(total_chunks):
             chunk = file_bytes[idx * FILE_CHUNK_SIZE:(idx + 1) * FILE_CHUNK_SIZE]
             frames.append({
@@ -1321,6 +1978,28 @@ def send_file(headers="guest", body="anonymous"):
 
         targets = {}
         if channel == "global":
+            # Store global file in Tracker's memory cache so newly connected peers can sync it
+            tracker_file_res = _tracker_request(
+                "/global-file/",
+                method="POST",
+                payload={
+                    "msg_id": f"file:{file_id}",
+                    "file_id": file_id,
+                    "sender": sender,
+                    "filename": filename,
+                    "sha256": sha256_hex,
+                    "timestamp": timestamp,
+                    "file_data_b64": base64.b64encode(file_bytes).decode("ascii"),
+                },
+            )
+            if tracker_file_res.get("status") != "success":
+                _update_transfer_progress(
+                    file_id, filename, "send", 0, "error", False, file_size
+                )
+                return _error_response(
+                    f"Tracker failed to store global file: {tracker_file_res.get('message', 'unknown error')}"
+                )
+
             with _state_lock:
                 for uname, info in _known_peers_cache.items():
                     if uname == sender:
@@ -1356,6 +2035,16 @@ def send_file(headers="guest", body="anonymous"):
                 )
                 return _error_response(f"Peer '{target}' not found or offline")
 
+            # Enforce strict connect-before-chat for private 1-1 file transfer
+            for addr_key, (t_ip, t_port) in targets.items():
+                if not _is_peer_connected(t_ip, t_port, target):
+                    _update_transfer_progress(
+                        file_id, filename, "send", 0, "error", False, file_size
+                    )
+                    return _error_response(
+                        f"Chưa kết nối P2P với {target}. Hãy bấm Connect trước khi gửi file!"
+                    )
+
         sent = []
         failed = []
         results_lock = threading.Lock()
@@ -1368,7 +2057,9 @@ def send_file(headers="guest", body="anonymous"):
                     file_id, filename, "send", pct, "sending", True, file_size
                 )
 
-            ok, err = _send_p2p_frames(ip, port, frames, on_progress=_progress_cb)
+            ok, err = _send_p2p_frames(
+                ip, port, frames, on_progress=_progress_cb, wait_ack=True
+            )
             with results_lock:
                 if ok:
                     sent.append(addr_key)
@@ -1385,8 +2076,9 @@ def send_file(headers="guest", body="anonymous"):
             t.start()
             threads.append(t)
 
+        join_timeout = max(FILE_SOCKET_TIMEOUT_SECONDS + 1.0, total_frames * 0.05 + 10.0)
         for t in threads:
-            t.join(timeout=FILE_SOCKET_TIMEOUT_SECONDS + 1.0)
+            t.join(timeout=join_timeout)
 
         if channel == "private" and not sent:
             err_msg = failed[0]["error"] if failed else "Failed to send file"
@@ -1408,6 +2100,7 @@ def send_file(headers="guest", body="anonymous"):
             peer_key=peer_key,
             mark_unread=False,
             extra={
+                "msg_id": f"file:{file_id}",
                 "type": "file",
                 "file_id": file_id,
                 "filename": filename,
